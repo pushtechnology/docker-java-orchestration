@@ -13,30 +13,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.DockerException;
 import com.github.dockerjava.api.async.ResultCallback;
-import com.github.dockerjava.api.command.BuildImageCmd;
-import com.github.dockerjava.api.command.CreateContainerCmd;
-import com.github.dockerjava.api.command.CreateContainerResponse;
-import com.github.dockerjava.api.command.InspectContainerCmd;
-import com.github.dockerjava.api.command.InspectContainerResponse;
-import com.github.dockerjava.api.command.ListContainersCmd;
-import com.github.dockerjava.api.command.ListImagesCmd;
-import com.github.dockerjava.api.command.LogContainerCmd;
-import com.github.dockerjava.api.command.PushImageCmd;
-import com.github.dockerjava.api.command.RemoveContainerCmd;
-import com.github.dockerjava.api.command.SaveImageCmd;
-import com.github.dockerjava.api.command.StartContainerCmd;
-import com.github.dockerjava.api.command.StopContainerCmd;
-import com.github.dockerjava.api.command.TagImageCmd;
+import com.github.dockerjava.api.command.*;
 import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.BuildResponseItem;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.Identifier;
 import com.github.dockerjava.api.model.Image;
 import com.github.dockerjava.api.model.PushResponseItem;
+import com.github.dockerjava.api.model.Repository;
 import com.github.dockerjava.api.model.StreamType;
 import com.google.common.collect.Lists;
-
 import org.apache.commons.lang.time.StopWatch;
 import org.glassfish.jersey.client.ClientResponse;
 import org.junit.After;
@@ -65,7 +53,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-import static org.hamcrest.core.IsEqual.equalTo;
+import static org.hamcrest.core.StringEndsWith.endsWith;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThat;
@@ -76,6 +64,7 @@ import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -84,7 +73,7 @@ import static org.mockito.Mockito.when;
 @RunWith(MockitoJUnitRunner.class)
 public class DockerOrchestratorTest {
 
-    public static final String EXTRA_HOST = "foo:127.0.0.1";
+    private static final String EXTRA_HOST = "foo:127.0.0.1";
     private static final String IMAGE_NAME = "theImage";
     private static final String IMAGE_ID = "imageId";
     private static final String CONTAINER_NAME = "theContainer";
@@ -136,9 +125,13 @@ public class DockerOrchestratorTest {
     @Mock
     private ListContainersCmd listContainersCmdMock;
     @Mock
+    private RemoveImageCmd removeImageCmdMock;
+    @Mock
     private RemoveContainerCmd removeContainerCmdMock;
     @Mock
     private StopContainerCmd stopContainerCmdMock;
+    @Mock
+    private CopyFileFromContainerCmd copyFileFromContainerMock;
     @Mock
     private TagImageCmd tagImageCmdMock;
     @Mock
@@ -157,6 +150,9 @@ public class DockerOrchestratorTest {
     private TailFactory tailFactoryMock;
     @Mock
     private InputStream saveInputStream;
+    @Mock
+    private InputStream tarInputStream;
+
     private DockerOrchestrator testObj;
 
     @Before
@@ -201,6 +197,9 @@ public class DockerOrchestratorTest {
         when(repoMock.ids(true)).thenReturn(Collections.singletonList(idMock));
         when(repoMock.tag(any(Id.class))).thenReturn(IMAGE_NAME + ":" + TAG_NAME);
 
+        when(dockerMock.removeImageCmd(anyString())).thenReturn(removeImageCmdMock);
+        when(removeImageCmdMock.withForce()).thenReturn(removeImageCmdMock);
+
         when(dockerMock.buildImageCmd(eq(fileMock))).thenReturn(buildImageCmdMock);
         when(buildImageCmdMock.withRemove(anyBoolean())).thenReturn(buildImageCmdMock);
         when(buildImageCmdMock.withTag(any(String.class))).thenReturn(buildImageCmdMock);
@@ -232,6 +231,14 @@ public class DockerOrchestratorTest {
         when(createContainerCmdMock.withName(eq(CONTAINER_NAME))).thenReturn(createContainerCmdMock);
 
         when(createContainerResponse.getId()).thenReturn(CONTAINER_ID);
+
+        when(dockerMock.copyFileFromContainerCmd(any(String.class), any(String.class))).thenReturn(copyFileFromContainerMock);
+        when(copyFileFromContainerMock.exec()).thenReturn(tarInputStream);
+        when(copyFileFromContainerMock.withContainerId(CONTAINER_ID)).thenReturn(copyFileFromContainerMock);
+        when(copyFileFromContainerMock.withResource(any(String.class))).thenReturn(copyFileFromContainerMock);
+        when(copyFileFromContainerMock.withHostPath(any(String.class))).thenReturn(copyFileFromContainerMock);
+        when(copyFileFromContainerMock.getContainerId()).thenReturn(CONTAINER_ID);
+        when(tarInputStream.read(any(byte[].class), anyInt(), anyInt())).thenReturn(-1);
 
         when(dockerMock.startContainerCmd(CONTAINER_ID)).thenReturn(startContainerCmdMock);
         when(dockerMock.stopContainerCmd(CONTAINER_ID)).thenReturn(stopContainerCmdMock);
@@ -300,20 +307,37 @@ public class DockerOrchestratorTest {
     }
 
     @After
-    public void teadDown() {
+    public void tearDown() {
         backgroundExecutor.shutdown();
+    }
+
+    @Test
+    public void cleaningForcesImageRemoval() throws Exception {
+
+        testObj.clean();
+
+        verify(removeImageCmdMock).withForce();
+        verify(removeImageCmdMock).exec();
     }
 
     @Test
     public void createAndStartNewContainer() throws DockerException, IOException {
 
-        when(listContainersCmdMock.exec()).thenReturn(Collections.<Container>emptyList());
+        mockRunningIdMock();
 
         testObj.start();
 
         verify(createContainerCmdMock).exec();
         verify(createContainerCmdMock).withExtraHosts(EXTRA_HOST);
         verify(startContainerCmdMock).exec();
+    }
+
+    private void mockRunningIdMock() {
+        final Container container = mock(Container.class);
+        when(container.getImage()).thenReturn("idMock");
+        when(container.getNames()).thenReturn(new String[0]);
+        when(listContainersCmdMock.exec()).thenReturn(Collections.<Container>emptyList()).thenReturn(Collections.singletonList(container));
+        when(repoMock.imageName(any(Id.class))).thenReturn("idMock");
     }
 
     @Test
@@ -354,6 +378,14 @@ public class DockerOrchestratorTest {
         testObj.stop();
 
         verify(stopContainerCmdMock).exec();
+    }
+
+    @Test
+    public void copyResourceFromContainer() throws DockerException, IOException {
+        when(listContainersCmdMockOnlyRunning.exec()).thenReturn(Collections.<Container>emptyList());
+        testObj.copy("a resource", "a path");
+
+        verify(copyFileFromContainerMock, times(1)).exec();
     }
 
     @Test
@@ -412,13 +444,14 @@ public class DockerOrchestratorTest {
             // need to get here
         }
         verify(dockerMock).pushImageCmd(IMAGE_NAME);
+        verify(pushImageCmd, never()).withTag(anyString());
     }
 
     @Test
     public void pushImageWithRegistryAndPort() {
-        String repositoryWithRegistryAndPort = "my.registry.com:5000/mynamespace/myrepository";
+        final Identifier identifier = new Identifier(new Repository("my.registry.com:5000/mynamespace/myrepository"), TAG_NAME);
 
-        when(repoMock.tags(idMock)).thenReturn(Collections.singletonList(repositoryWithRegistryAndPort + ":" + TAG_NAME));
+        when(repoMock.tags(idMock)).thenReturn(Collections.singletonList(identifier.repository.name + ":" + TAG_NAME));
         try {
             testObj.push();
             fail("Exception expected");
@@ -427,7 +460,8 @@ public class DockerOrchestratorTest {
             // need to get here
         }
 
-        verify(dockerMock).pushImageCmd(repositoryWithRegistryAndPort);
+        verify(dockerMock).pushImageCmd(identifier.repository.name);
+        verify(pushImageCmd).withTag(TAG_NAME);
     }
 
     @Test
@@ -473,11 +507,22 @@ public class DockerOrchestratorTest {
     public void privilegedConfigurationStartsPrivilegedContainer() throws Exception {
 
         when(confMock.isPrivileged()).thenReturn(true);
-        when(listContainersCmdMock.exec()).thenReturn(Collections.<Container>emptyList());
+        mockRunningIdMock();
 
         testObj.start();
 
         verify(createContainerCmdMock).withPrivileged(true);
+    }
+
+    @Test
+    public void networkModeConfigurationStartsContainerInSpecifiedNetworkMode() {
+        when(confMock.getNetworkMode()).thenReturn("host");
+        mockRunningIdMock();
+
+        testObj.start();
+
+        verify(createContainerCmdMock).withNetworkMode("host");
+
     }
 
     @Test
@@ -511,7 +556,7 @@ public class DockerOrchestratorTest {
             testObj.start();
             fail();
         } catch (OrchestrationException e) {
-            assertThat(e.getMessage(), equalTo(String.format("%s's log ended before [\"^Foo$\"] appeared in output", idMock)));
+            assertThat(e.getMessage(), endsWith(String.format("%s's log ended before [\"^Foo$\"] appeared in output", idMock)));
         }
     }
 
@@ -542,7 +587,7 @@ public class DockerOrchestratorTest {
             testObj.start();
             fail();
         } catch (OrchestrationException e) {
-            assertEquals(String.format("timeout after 0 while waiting for \"%s\" in %s's logs", firstLogPattern.getPattern(), idMock), e.getMessage());
+            assertThat(e.getMessage(), endsWith(String.format("timeout after 0 while waiting for \"%s\" in %s's logs", firstLogPattern.getPattern(), idMock)));
         }
 
         verify(logger).info(eq("Waiting for {} to appear in output"), eq("[\"^Foo$\", \"^Bar$\"]"));
